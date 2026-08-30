@@ -155,34 +155,43 @@ async function callProvider(
   timeoutMs: number
 ): Promise<LlmResponse> {
   switch (provider) {
-    case "openrouter":
+    case "openrouter": {
+      const model = getEnvVar("OPENROUTER_MODEL");
+      console.log(`[LLM] Trying provider "openrouter" with model ${model}`);
       return callOpenAiCompatible(
         "openrouter",
         getEnvVar("OPENROUTER_API_KEY"),
         "https://openrouter.ai/api/v1",
-        getEnvVar("OPENROUTER_MODEL"),
+        model,
         systemPrompt,
         userPrompt,
         timeoutMs
       );
-    case "groq":
+    }
+    case "groq": {
+      const model = getEnvVar("GROQ_MODEL");
+      console.log(`[LLM] Trying provider "groq" with model ${model}`);
       return callOpenAiCompatible(
         "groq",
         getEnvVar("GROQ_API_KEY"),
         "https://api.groq.com/openai/v1",
-        getEnvVar("GROQ_MODEL"),
+        model,
         systemPrompt,
         userPrompt,
         timeoutMs
       );
-    case "gemini":
+    }
+    case "gemini": {
+      const model = getEnvVar("GEMINI_MODEL");
+      console.log(`[LLM] Trying provider "gemini" with model ${model}`);
       return callGemini(
         getEnvVar("GEMINI_API_KEY"),
-        getEnvVar("GEMINI_MODEL"),
+        model,
         systemPrompt,
         userPrompt,
         timeoutMs
       );
+    }
     default:
       throw new Error(`Unknown AI provider: ${provider}`);
   }
