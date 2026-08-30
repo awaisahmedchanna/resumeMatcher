@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { LLMResponseSchema } from "@/lib/resume/schemas";
 
 interface LlmResponse {
   content: string;
@@ -27,14 +28,41 @@ function getProviderOrder(): string[] {
   return providers;
 }
 
-function isRetryableError(status?: number): boolean {
-  if (status && [429, 500, 502, 503, 504].includes(status)) return true;
-  return false;
+function getMaxOutputTokens(provider: string): number {
+  const providerSpecific = process.env[`LLM_MAX_OUTPUT_TOKENS_${provider.toUpperCase()}`];
+  if (providerSpecific) {
+    const n = parseInt(providerSpecific, 10);
+    if (!Number.isNaN(n) && n > 0) return n;
+  }
+  const global = parseInt(process.env.LLM_MAX_OUTPUT_TOKENS || "", 10);
+  if (!Number.isNaN(global) && global > 0) return global;
+
+  // The resume JSON + LaTeX easily exceeds 8k tokens (the old default), which used
+  // to produce truncated "invalid JSON" responses.
+  switch (provider) {
+    case "groq":
+      // Groq's free tier counts input+output against one 8000-TPM budget per minute.
+      // Input (truncated resume+JD) is ~4k tokens, so output must stay ~3k or the
+      // request is rejected outright (413). Oversized outputs may still truncate and
+      // fall through to the next provider in the chain.
+      return 3000;
+    case "gemini":
+      return 32768;
+    default:
+      return 16384;
+  }
 }
 
-function isValidJSON(text: string): boolean {
+function schemaValidJSON(content: string): string | null {
+  if (isValidLLMJSON(content)) return content;
+  const maybeJSON = extractJSONFromText(content);
+  if (maybeJSON && isValidLLMJSON(maybeJSON)) return maybeJSON;
+  return null;
+}
+
+function isValidLLMJSON(text: string): boolean {
   try {
-    JSON.parse(text);
+    LLMResponseSchema.parse(JSON.parse(text));
     return true;
   } catch {
     return false;
@@ -75,7 +103,8 @@ async function callOpenAiCompatible(
           { role: "user", content: userPrompt },
         ],
         temperature: 0.3,
-        max_tokens: 8192,
+        max_tokens: getMaxOutputTokens(provider),
+        response_format: { type: "json_object" },
       },
       { signal: controller.signal }
     );
@@ -119,7 +148,8 @@ async function callGemini(
         ],
         generationConfig: {
           temperature: 0.3,
-          maxOutputTokens: 8192,
+          maxOutputTokens: getMaxOutputTokens("gemini"),
+          responseMimeType: "application/json",
         },
       }),
       signal: controller.signal,
@@ -208,44 +238,62 @@ export async function callLlmWithFallback(
 
   console.log(`[LLM] Trying providers in order: ${order.join(", ")} (timeout ${timeoutMs}ms)`);
 
+  // Small models (e.g. llama-3.1-8b) sometimes return schema-incomplete JSON. Give
+  // each provider one repair retry before falling through to the next provider.
+  const repairSuffix = `
+IMPORTANT: The previous response was invalid or incomplete.
+Return the COMPLETE JSON object, and only that JSON, with ALL of these keys:
+"previousScore", "newScore", "summary", "missingKeywords", "addedKeywords",
+"weakAreas", "changes", "beforeAfterBullets", "optimizedResume" (with name, title,
+email, phone, location, links, summary, skills, experience, projects, education,
+certifications), and "latex".
+It must be complete and valid: no truncation, no markdown fences, no extra text.`;
+
   for (const provider of order) {
-    try {
-      const result = await callProvider(provider, systemPrompt, userPrompt, timeoutMs);
-      const content = result.content;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const effectiveUserPrompt =
+          attempt === 0 ? userPrompt : `${userPrompt}\n${repairSuffix}`;
+        const result = await callProvider(provider, systemPrompt, effectiveUserPrompt, timeoutMs);
 
-      if (!isValidJSON(content)) {
-        const maybeJSON = extractJSONFromText(content);
-        if (maybeJSON && isValidJSON(maybeJSON)) {
-          console.log(
-            `[LLM] Provider ${provider} (${result.modelUsed}) returned JSON embedded in text, extracted successfully`
-          );
-          return { content: maybeJSON, provider, modelUsed: result.modelUsed };
+        // Accept JSON only when it parses AND matches the expected resume schema.
+        // Free-tier output caps can truncate responses into valid-but-partial JSON,
+        // which must exhaust this provider's retries and fall through downstream.
+        const content = schemaValidJSON(result.content);
+
+        if (!content) {
+          if (attempt === 0) {
+            console.log(
+              `[LLM] Provider ${provider} (${result.modelUsed}) returned invalid/incomplete JSON - one repair retry`
+            );
+            continue;
+          }
+          lastError = `Provider ${provider} returned invalid or schema-incomplete JSON`;
+          console.log(`[LLM Fallback] ${lastError}`);
+          break;
         }
-        lastError = `Provider ${provider} returned invalid JSON`;
-        console.log(`[LLM Fallback] ${lastError}`);
-        continue;
-      }
 
-      console.log(`[LLM] Provider ${provider} (${result.modelUsed}) succeeded`);
-      return result;
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === "AbortError") {
-        lastError = `Provider ${provider} timed out after ${timeoutMs}ms`;
-        console.log(`[LLM Fallback] ${lastError}`);
-        continue;
-      }
-
-      if (err instanceof OpenAI.APIError) {
-        lastError = `Provider ${provider} failed: ${err.message}`;
-        console.log(`[LLM Fallback] ${lastError}`);
-        if (err.status === undefined || isRetryableError(err.status) || err.status === 404) {
-          continue;
+        console.log(
+          `[LLM] Provider ${provider} (${result.modelUsed}) succeeded${attempt === 0 ? "" : " after repair"}`
+        );
+        return { content, provider, modelUsed: result.modelUsed };
+      } catch (err: unknown) {
+        if (err instanceof Error && err.name === "AbortError") {
+          lastError = `Provider ${provider} timed out after ${timeoutMs}ms`;
+          console.log(`[LLM Fallback] ${lastError}`);
+          break;
         }
-        continue;
-      }
 
-      lastError = err instanceof Error ? err.message : String(err);
-      console.log(`[LLM Fallback] Provider ${provider} error: ${lastError}`);
+        if (err instanceof OpenAI.APIError) {
+          lastError = `Provider ${provider} failed: ${err.message}`;
+          console.log(`[LLM Fallback] ${lastError}`);
+          break;
+        }
+
+        lastError = err instanceof Error ? err.message : String(err);
+        console.log(`[LLM Fallback] Provider ${provider} error: ${lastError}`);
+        break;
+      }
     }
   }
 
