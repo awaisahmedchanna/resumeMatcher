@@ -25,10 +25,20 @@ export function extractResumeText(
   throw new Error("Unsupported file type. Please upload a PDF, DOCX, or TXT file.");
 }
 
+async function polyfillPdfGlobals(): Promise<void> {
+  const g = globalThis as Record<string, unknown>;
+  if (g.DOMMatrix && g.Path2D && g.ImageData) return;
+  const canvas = await import("@napi-rs/canvas");
+  g.DOMMatrix ??= canvas.DOMMatrix;
+  g.Path2D ??= canvas.Path2D;
+  g.ImageData ??= canvas.ImageData;
+}
+
 async function extractPDFText(buffer: Buffer): Promise<string> {
   const originalWarn = console.warn;
   console.warn = () => {};
   try {
+    await polyfillPdfGlobals();
     const mod = await import("pdf-parse");
     const PDFParse = mod.PDFParse;
     const instance = new PDFParse(new Uint8Array(buffer));
