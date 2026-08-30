@@ -34,11 +34,26 @@ async function polyfillPdfGlobals(): Promise<void> {
   g.ImageData ??= canvas.ImageData;
 }
 
+async function setupPdfJsWorker(): Promise<void> {
+  const g = globalThis as Record<string, unknown>;
+  if (g.pdfjsWorker) return;
+  try {
+    const worker = await import("pdfjs-dist/legacy/build/pdf.worker.mjs");
+    g.pdfjsWorker = { WorkerMessageHandler: worker.WorkerMessageHandler };
+  } catch (err) {
+    if (err instanceof Error) {
+      throw new Error(`Failed to set up PDF worker: ${err.message}`);
+    }
+    throw new Error("Failed to set up PDF worker unexpectedly.");
+  }
+}
+
 async function extractPDFText(buffer: Buffer): Promise<string> {
   const originalWarn = console.warn;
   console.warn = () => {};
   try {
     await polyfillPdfGlobals();
+    await setupPdfJsWorker();
     const mod = await import("pdf-parse");
     const PDFParse = mod.PDFParse;
     const instance = new PDFParse(new Uint8Array(buffer));
