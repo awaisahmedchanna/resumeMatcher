@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { extractResumeText } from "@/lib/resume/extractText";
 import { buildSystemPrompt, buildUserPrompt } from "@/lib/llm/prompts";
-import { callNvidiaWithFallback } from "@/lib/llm/nvidiaClient";
+import { callLlmWithFallback } from "@/lib/llm/llmClient";
 import { parseAndValidateLLMResponse } from "@/lib/llm/parseJson";
 import { generateLatexFromJSON, isValidLatex } from "@/lib/latex/generateLatex";
 import { renderResumePDFBase64 } from "@/lib/pdf/renderResumePdf";
@@ -78,7 +78,7 @@ export async function POST(request: NextRequest) {
       applicantName || undefined
     );
 
-    const { content } = await callNvidiaWithFallback(systemPrompt, userPrompt);
+    const { content } = await callLlmWithFallback(systemPrompt, userPrompt);
 
     const parsed = parseAndValidateLLMResponse(content);
 
@@ -123,7 +123,7 @@ export async function POST(request: NextRequest) {
 
     let message = "An unexpected error occurred. Please try again later.";
     if (error instanceof Error) {
-      if (error.message.includes("NVIDIA") || error.message.includes("API key")) {
+      if (error.message.includes("AI providers") || error.message.includes("API key")) {
         message = "AI providers are temporarily busy. Please try again later.";
       } else if (
         error.message.includes("PDF") ||
